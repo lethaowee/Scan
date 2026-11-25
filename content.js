@@ -166,6 +166,18 @@
     const ids = [read("hidHOSOBENHANID"), read("hidKHAMBENHID"), read("hidTIEPNHANID"), info && info.rowId];
     window.postMessage({ __hthTkNoiCdAsk: true, caseNo: info && info.caseNo || "", ids }, "*");
   }
+  // Why QUÉT's own NT.005.HSBA call gave no diagnosis, by HOSOBENHANID.
+  const scanIcdMiss = new Map();
+  // Ask icd_capture.js (page world) to call NT.005.HSBA for the open case, for
+  // a case HIS did not (re)load. -> the HOSOBENHANID asked for ("" = none).
+  function scanAskIcd(info) {
+    const el = document.getElementById("hidHOSOBENHANID");
+    const hoSoBenhAnId = el && "value" in el ? String(el.value || "").trim() : "";
+    scanIcdMiss.delete(hoSoBenhAnId);
+    window.postMessage({ __scanIcdAsk: true, caseNo: info && info.caseNo || "", hoSoBenhAnId,
+      ids: [info && info.rowId] }, "*");
+    return hoSoBenhAnId;
+  }
   function auditText(value) { return String(value ?? "").trim(); }
   function auditQty(value) {
     const s = auditText(value).replace(/,/g, ".").replace(/[^0-9.\-]/g, "");
@@ -2478,6 +2490,11 @@
       if (scanTkNoiCdMiss.size > 500) scanTkNoiCdMiss.delete(scanTkNoiCdMiss.keys().next().value);
       return;
     }
+    if (event.data.type === "ICD_MISS" && event.data.__scanIcdMsgV1 === true) {
+      scanIcdMiss.set(String(event.data.hoSoBenhAnId || "").trim(), String(event.data.reason || ""));
+      if (scanIcdMiss.size > 200) scanIcdMiss.delete(scanIcdMiss.keys().next().value);
+      return;
+    }
     if (event.data.type === "ICD_DATA" && event.data.__scanIcdMsgV1 === true) {
       const incomingHoSoId = auditNormalizeHoSoId(event.data.hoSoBenhAnId || (event.data.icdData && event.data.icdData.hoSoBenhAnId));
       const currentHoSoId = auditCurrentHoSoId() || auditNormalizeHoSoId(auditState.context && auditState.context.hoSoBenhAnId);
@@ -2489,7 +2506,6 @@
         mainCode: String(incomingIcd.mainCode || "").trim().toUpperCase(),
         mainName: String(incomingIcd.mainName || "").trim(),
         admissionTime: String(incomingIcd.admissionTime || "").trim(),
-        tkNoiCd: String(incomingIcd.tkNoiCd || "").trim(),
         diagnoses: incomingIcd.diagnoses.map(item => ({
           code: String(item && item.code || "").trim().toUpperCase(),
           name: String(item && item.name || "").trim()
@@ -2873,6 +2889,11 @@
     #scanx-scan-panel th{background:#f1f5f9;text-align:left}
     #scanx-scan-panel td,#scanx-scan-panel th{padding:3px 4px;border-bottom:1px solid #e7ebef;vertical-align:top;overflow-wrap:anywhere}
     #scanx-scan-panel td.sc-bad{color:#b91c1c;font-weight:700;background:#fff0f0}
+    #scanx-scan-panel .sc-lab-bad{color:#b91c1c;font-weight:700}
+    #scanx-scan-panel .sc-xn-table tr.sc-xn-group td{border-bottom:none}
+    #scanx-scan-panel .sc-xn-table tr.sc-lab-sub td{padding-top:1px;padding-bottom:1px;border-bottom:1px dotted #eef1f4}
+    #scanx-scan-panel .sc-xn-table td.sc-lab-name{text-align:right;color:#5f6368;padding-right:10px}
+    #scanx-scan-panel .sc-xn-table td.sc-lab-range{color:#5f6368}
     #scanx-scan-panel td.sc-warn{color:#8a5a00;background:#fff8d6}
   `;
   (document.head || document.documentElement).appendChild(scanStyle);
@@ -3162,13 +3183,19 @@
       .find(t => auditDateOnly(t)) || "";
     const visitDate = auditDateOnly(admissionText) ||
       auditDateOnly((text.match(/\b(\d{1,2}\/\d{1,2}\/\d{4}\s+\d{1,2}:\d{2})/) || [])[1] || "");
+    // Discharge date (Ra viện), for the old-case skip. hasDischargeColumn: the
+    // list has the column at all; an empty cell there = still admitted.
+    const dischargeCell = scanCellByField(row,
+      /_THOIGIANRAVIEN$|_THOIGIAN_RA_VIEN$|_NGAYRAVIEN$|_NGAY_RA_VIEN$|_NGAYHOSORAVIEN$|_NGAY_RA_DT$|_NGAYRADT$|_NGAYXUATVIEN$|_NGAY_XUAT_VIEN$/i);
+    const hasDischargeColumn = !!dischargeCell;
+    const dischargeDate = dischargeCell ? auditDateOnly(String(dischargeCell.textContent || "").trim()) : "";
     const cellText = pattern => { const td = scanCellByField(row, pattern); return td ? String(td.textContent || "").replace(/\s+/g, " ").trim() : ""; };
     const bhyt = cellText(/_MA_BHYT$|_MABHYT$/i);
     const address = cellText(/_DIACHI$/i);
     const birthYear = ((cellText(/_NGAYSINH$|_NAMSINH$/i) || dobText).match(/\b((?:19|20)\d{2})\b/) || [])[1] || "";
     // Full birth date (dd/MM/yyyy) when the list shows one: BHYT portal fallback.
     const dob = ((cellText(/_NGAYSINH$/i) || dobText).match(/\b(\d{1,2}\/\d{1,2}\/\d{4})\b/) || [])[1] || "";
-    return { index, row, rowId: row.id || "", caseNo, name, patientKey, visitDate, bhyt, address, birthYear, dob,
+    return { index, row, rowId: row.id || "", caseNo, name, patientKey, visitDate, hasDischargeColumn, dischargeDate, bhyt, address, birthYear, dob,
       label: [caseNo, name].filter(Boolean).join(" – ") || text.slice(0, 80) };
   }
   // The patient list grid: #grdLS on most HIS screens, but some list screens
@@ -3495,9 +3522,13 @@
     const now = new Date();
     return scanLookbackStart(new Date(now.getFullYear(), now.getMonth(), now.getDate()), SCAN_REPEAT_LOOKBACK_MONTHS);
   }
-  // Patients (admission day) and XN rows dated before (today - 3 months,
-  // same day) are skipped: not scanned, not listed, not reported.
+  // XN / thuốc / PTTT rows whose TG chỉ định is before (today - 3 months,
+  // same day) are skipped: not listed, not reported. Patients discharged before
+  // that day are not scanned (see the patient filter in the scan loop).
   const SCAN_SKIP_OLDER_MONTHS = 3;
+  // No Ra viện column in the list: patients whose Đến khám is more than this
+  // many days before the cutoff are not scanned (a stay longer than this can be missed).
+  const SCAN_SKIP_ADMISSION_MARGIN_DAYS = 30;
   function scanSkipCutoff() {
     const now = new Date();
     return scanLookbackStart(new Date(now.getFullYear(), now.getMonth(), now.getDate()), SCAN_SKIP_OLDER_MONTHS);
@@ -3700,8 +3731,15 @@
     const m = auditText(value).replace(",", ".").match(/-?\d+(?:\.\d+)?/);
     return m ? Number(m[0]) : null;
   }
+  // Sốc nhiễm trùng (R57.2) among the case's diagnoses (main or secondary, NT.005.HSBA).
+  function scanHasSepticShock(icdData) {
+    const diagnoses = Array.isArray(icdData && icdData.diagnoses) ? icdData.diagnoses : [];
+    return [icdData && icdData.mainCode, ...diagnoses.map(item => item && item.code)]
+      .some(code => String(code || "").replace(/\s+/g, "").toUpperCase().replace(/^R572$/, "R57.2") === "R57.2");
+  }
   // withDrugs: the Thuốc tab was scanned too, so the ALBUNORM rule can run:
-  // ERROR when a blood albumin result is > 25 g/L AND ALBUNORM is ordered the same day.
+  // ERROR when a blood albumin result is > 25 g/L AND ALBUNORM is ordered the same day
+  // AND the case has no sốc nhiễm trùng diagnosis (R57.2).
   // One error per ALBUNORM order day; badDrugRows gets the ALBUNORM rows.
   function scanAlbuminFindings(withDrugs = false) {
     const infos = [];
@@ -3754,6 +3792,8 @@
       }
       const fmt = list => list.map(h => `${auditText(h.row.value)} ${auditText(h.row.unit) || "g/L"}${h.when ? ` (${h.when.split(" ")[1] || h.when})` : ""}`).join(", ");
       const seen = new Set();
+      const caseIcd = auditMatchingIcdData();
+      const septicShock = scanHasSepticShock(caseIcd);
       for (const row of Array.from(auditState.medicineRows.values()).filter(scanIsAlbunorm)) {
         const when = auditDateTimeText(rowOrderSource(row, Array.isArray(row.timePoints) ? row.timePoints : []));
         const day = auditDateOnly(when);
@@ -3762,14 +3802,25 @@
         const sameDay = day ? results.filter(h => auditDateOnly(h.when) === day) : [];
         const high = sameDay.filter(h => h.value !== null && h.value > 25);
         const detail = `Y lệnh ${when || "chưa rõ ngày"}; ${auditText(row.quantity)} ${auditText(row.unit)}`.trim();
-        if (high.length) badDrugRows.set(row, `Dùng ${name} khi Albumin máu > 25 g/L (kết quả: ${fmt(high)}).`);
+        if (high.length && !septicShock && caseIcd) badDrugRows.set(row, `Dùng ${name} khi Albumin máu > 25 g/L, không có chẩn đoán sốc nhiễm trùng (R57.2) (kết quả: ${fmt(high)}).`);
         const dayKey = `${domToken(name)}|${day}`;
         if (seen.has(dayKey)) continue;
         seen.add(dayKey);
-        if (high.length) {
-          // ERROR: same-day albumin > 25 g/L.
+        if (high.length && !caseIcd) {
+          // WARNING: albumin > 25 g/L but the diagnosis was not read, so R57.2 cannot be checked.
+          infos.push({ module: "Albunorm", date: day, time: when.split(" ")[1] || "", item: "",
+            message: `Dùng thuốc ${name}; Albumin máu cùng ngày: ${fmt(high)}; chưa đọc được chẩn đoán (NT.005.HSBA) nên chưa kiểm tra được R57.2.`,
+            detail });
+        } else if (high.length && !septicShock) {
+          // ERROR: same-day albumin > 25 g/L and no R57.2 diagnosis.
           errors.push({ module: "Albumin", date: day, time: when.split(" ")[1] || "", item: "",
-            message: `Dùng thuốc ${name} khi Albumin máu > 25 g/L (kết quả: ${fmt(high)}).`, detail });
+            message: `Dùng thuốc ${name} khi Albumin máu > 25 g/L, không có chẩn đoán sốc nhiễm trùng (R57.2) (kết quả: ${fmt(high)}).`,
+            detail });
+        } else if (high.length) {
+          // WARNING: albumin > 25 g/L but the case has sốc nhiễm trùng (R57.2).
+          infos.push({ module: "Albunorm", date: day, time: when.split(" ")[1] || "", item: "",
+            message: `Dùng thuốc ${name}; Albumin máu cùng ngày: ${fmt(high)}; có chẩn đoán sốc nhiễm trùng (R57.2).`,
+            detail });
         } else {
           // WARNING: ALBUNORM without a same-day albumin result > 25 g/L.
           infos.push({ module: "Albunorm", date: day, time: when.split(" ")[1] || "", item: "",
@@ -3801,9 +3852,15 @@
       errors.push({ module: "CT", date: scanFirstDay(cells[3], cells[4], cells[5]), time: scanFirstTime(cells[3], cells[4], cells[5]), item: `${cells[0] || ""} ${cells[1] || ""}`.trim(), message: cells[cells.length - 1] || "" });
     }
     // [Thiếu chẩn đoán]: a drug of drugDiagnosisRules (by mã thuốc) without a matching diagnosis.
+    // Diagnosis not read (NT.005.HSBA): a yellow note, not an error.
+    const icdNotes = [];
+    // TEMP: [Thiếu chẩn đoán] check (and its "Chẩn đoán" notes) hidden from the user for now.
+    // Remove the /* */ below to bring it back.
+    /*
     const drugTargets = scanned.thuoc ? auditDrugDiagnosisTargets() : [];
     if (drugTargets.length) {
       const caseIcd = auditMatchingIcdData();
+      const icdMissReason = caseIcd ? "" : (scanIcdMiss.get(auditCurrentHoSoId()) || "");
       const admissionTime = auditText(caseIcd && caseIcd.admissionTime);
       const admissionDay = scanFirstDay(admissionTime) || (info && info.visitDate) || "";
       for (const { rule, rows } of drugTargets) {
@@ -3819,16 +3876,21 @@
           const orderText = auditText(row.orderDate) || day || "chưa rõ ngày";
           // Shown: "10/09/2026 15:00:00 [Thiếu chẩn đoán]: Thuốc Kavasdin 5".
           // Order / admission times and the no-ICD case are kept for the hover.
-          const detail = caseIcd
-            ? `Y lệnh ${orderText}; vào viện ${admissionTime || admissionDay || "chưa rõ"}: thiếu chẩn đoán phù hợp.`
-            : `Y lệnh ${orderText}: chưa đọc được chẩn đoán (NT.005.HSBA) nên không kiểm tra được.`;
           // No order date: the error falls on the admission day, so show its time.
           const time = scanFirstDay(row.orderDate) ? (auditDateTimeText(row.orderDate).split(" ")[1] || "")
             : (auditDateTimeText(admissionTime).split(" ")[1] || "");
+          if (!caseIcd) {
+            icdNotes.push({ module: "Chẩn đoán", date: day, time, item: "",
+              message: `Thuốc ${name}: chưa đọc được chẩn đoán (NT.005.HSBA) nên chưa kiểm tra được thiếu chẩn đoán.`,
+              detail: `Y lệnh ${orderText}${icdMissReason ? `; ${icdMissReason}` : ""}.` });
+            continue;
+          }
+          const detail = `Y lệnh ${orderText}; vào viện ${admissionTime || admissionDay || "chưa rõ"}: thiếu chẩn đoán phù hợp.`;
           errors.push({ module: "Thiếu chẩn đoán", date: day, time, item: "", message: `Thuốc ${name}`, detail });
         }
       }
     }
+    */
     const pttt = scanned.pttt ? scanPtttFindings() : { errors: [], rows: [] };
     errors.push(...pttt.errors);
     const albumin = scanned.xn ? scanAlbuminFindings(!!scanned.thuoc) : { errors: [], infos: [], badDrugRows: new Map() };
@@ -3843,7 +3905,8 @@
         const source = rowOrderSource(row, Array.isArray(row.timePoints) ? row.timePoints : []);
         return { day: auditDateOnly(source), dateTime: auditDateTimeText(source),
           code: auditText(row.bhytCode || row.hisCode || row.serviceCode), name: auditText(row.name),
-          quantity: auditText(row.quantity), status: "", bad: false };
+          quantity: auditText(row.quantity), status: "", bad: false,
+          results: scanLabResultsForRow(row, auditState.contextKey) };
       })
       .filter(row => !scanIsTooOld(row.day, cutoff)) : [];
     // Every medicine row captured for the visit, for the "Thuốc" table
@@ -3867,14 +3930,51 @@
     const xnModules = new Set(["DVKT", "CT", "PTTT", "Albumin"]);
     return {
       errors: errors.filter(err => !(xnModules.has(err.module) && scanIsTooOld(err.date, cutoff))),
-      // Warnings (yellow): Albumin > 25 g/L.
-      infos: albumin.infos.filter(info => !scanIsTooOld(info.date, cutoff)),
+      // Warnings (yellow): diagnosis not read, Albumin / Albunorm info lines.
+      infos: [...icdNotes, ...albumin.infos.filter(info => !scanIsTooOld(info.date, cutoff))],
       xnRows,
       drugRows,
       ptttRows,
       repeatTests: scanned.xn ? scanCollectRepeatTests(fallbackDay) : [],
       counts: { dvkt: auditState.dvktRows.size, drug: auditState.medicineRows.size, services: currentRows.length }
     };
+  }
+
+  // Is a lab value outside its normal range? Range text from HIS, e.g.
+  // "( 135 - 145 )", "( < 35 )", "(> 60)". null = cannot tell.
+  function scanLabOutOfRange(value, range) {
+    const num = t => { const n = parseFloat(String(t).replace(",", ".")); return Number.isFinite(n) ? n : null; };
+    const text = String(value || "").trim();
+    const v = /^-?\d+(?:[.,]\d+)?$/.test(text) ? num(text) : null;
+    if (v === null) return null;
+    const r = String(range || "").replace(/[()]/g, " ").trim();
+    let m = r.match(/^(-?[\d.,]+)\s*[-–]\s*(-?[\d.,]+)$/);
+    if (m) { const lo = num(m[1]), hi = num(m[2]); return lo !== null && hi !== null ? (v < lo || v > hi) : null; }
+    m = r.match(/^(<=?|≤)\s*(-?[\d.,]+)$/);
+    if (m) { const hi = num(m[2]); return hi === null ? null : (m[1] === "<" ? v >= hi : v > hi); }
+    m = r.match(/^(>=?|≥)\s*(-?[\d.,]+)$/);
+    if (m) { const lo = num(m[2]); return lo === null ? null : (m[1] === ">" ? v <= lo : v < lo); }
+    return null;
+  }
+
+  // The "Kết quả xét nghiệm" lines of one XN/DVKT row: same phiếu
+  // (MAUBENHPHAMID) and same service (order name or code).
+  function scanLabResultsForRow(row, key) {
+    const ticket = auditText(row.ticketId);
+    const name = domToken(auditText(row.name));
+    const codes = new Set([auditText(row.bhytCode), auditText(row.hisCode)].filter(Boolean));
+    const out = [];
+    for (const lab of auditState.labResults.values()) {
+      if (key && lab.contextKey && lab.contextKey !== key) continue;
+      if (ticket && auditText(lab.phieuId) && auditText(lab.phieuId) !== ticket) continue;
+      const sameService = (name && (domToken(auditText(lab.orderName)) === name || domToken(auditText(lab.name)) === name)) ||
+        codes.has(auditText(lab.bhytCode)) || codes.has(auditText(lab.code));
+      if (!sameService) continue;
+      const range = auditText(lab.normalRange);
+      out.push({ name: auditText(lab.name), value: auditText(lab.value), unit: auditText(lab.unit), range,
+        abnormal: scanLabOutOfRange(lab.value, range) === true });
+    }
+    return out;
   }
 
   function scanRenderResults() {
@@ -3938,8 +4038,14 @@
         if (badCount) details.open = true;
         details.appendChild(auditElement("summary", "", `Xét nghiệm / DVKT (${xnRows.length})${badCount ? ` · ${badCount} dòng lỗi` : " · không lỗi"}`));
         const table = document.createElement("table");
+        table.className = "sc-xn-table";
+        const cols = document.createElement("colgroup");
+        for (const w of ["15%", "10%", "31%", "5%", "21%", "18%"]) {
+          const col = document.createElement("col"); col.style.width = w; cols.appendChild(col);
+        }
+        table.appendChild(cols);
         const thead = document.createElement("tr");
-        for (const h of ["Ngày giờ", "Mã", "Tên", "SL"]) thead.appendChild(auditElement("th", "", h));
+        for (const h of ["Ngày giờ", "Mã", "Tên", "SL", "Kết quả", "Trị số BT"]) thead.appendChild(auditElement("th", "", h));
         table.appendChild(thead);
         for (const r of xnRows) {
           if (onlyErrors && !r.bad) continue;
@@ -3948,7 +4054,30 @@
           tr.appendChild(auditElement("td", r.bad ? "sc-bad" : "", r.code));
           tr.appendChild(auditElement("td", r.bad ? "sc-bad" : "", r.name));
           tr.appendChild(auditElement("td", "", r.quantity));
+          // One result: value + range on the service row. Several (Na+, K+,
+          // Cl-, công thức máu ...): one sub-row each, so value and range stay
+          // on the same line. Out of range in red.
+          const results = Array.isArray(r.results) ? r.results : [];
+          const resultText = lab => `${lab.value}${lab.unit ? " " + lab.unit : ""}`;
+          if (results.length === 1) {
+            tr.appendChild(auditElement("td", results[0].abnormal ? "sc-lab-bad" : "", resultText(results[0])));
+            tr.appendChild(auditElement("td", "sc-lab-range", results[0].range || "--"));
+          } else {
+            tr.appendChild(auditElement("td", "", ""));
+            tr.appendChild(auditElement("td", "", ""));
+          }
+          if (results.length > 1) tr.className = "sc-xn-group";
           table.appendChild(tr);
+          if (results.length > 1) for (const lab of results) {
+            const sub = document.createElement("tr");
+            sub.className = "sc-lab-sub";
+            const nameTd = auditElement("td", "sc-lab-name", lab.name || "");
+            nameTd.colSpan = 4;
+            sub.append(nameTd,
+              auditElement("td", lab.abnormal ? "sc-lab-bad" : "", resultText(lab)),
+              auditElement("td", "sc-lab-range", lab.range || "--"));
+            table.appendChild(sub);
+          }
         }
         details.appendChild(table); box.appendChild(details);
       }
@@ -4673,12 +4802,29 @@
         scanStatus.textContent = "Chưa chọn bệnh nhân nào trong danh sách HIS. Hãy chọn (hoặc tích) bệnh nhân cần quét, hoặc chuyển sang \"Tất cả\".";
         return;
       }
-      // Patients admitted more than SCAN_SKIP_OLDER_MONTHS ago are not scanned.
+      // Old cases are skipped only when none of their rows can be on/after the
+      // cutoff (rows are then filtered by TG chỉ định in scanCollectFindings).
+      // A patient can come before the cutoff and get a test after it (in 21/08,
+      // XN on 26/08), so Đến khám alone is not enough:
+      // - list has a Ra viện column: skip when discharged before the cutoff;
+      //   still admitted (empty cell) or discharged later -> scan.
+      // - no Ra viện column: skip when Đến khám is more than
+      //   SCAN_SKIP_ADMISSION_MARGIN_DAYS before the cutoff.
       const skipCutoff = scanSkipCutoff();
-      patients = inScope.filter(p => !scanIsTooOld(p.visitDate, skipCutoff))
-        .map((p, i) => ({ ...p, index: i, patientKey: options.personKey || p.patientKey }));
-      const skippedOld = inScope.length - patients.length;
-      skippedText = skippedOld ? ` · bỏ qua ${skippedOld} ca vào viện trước ${scanFormatDay(skipCutoff)}` : "";
+      const admissionCutoff = new Date(skipCutoff.getFullYear(), skipCutoff.getMonth(), skipCutoff.getDate() - SCAN_SKIP_ADMISSION_MARGIN_DAYS);
+      let skippedDischarged = 0, skippedAdmitted = 0;
+      patients = inScope.filter(p => {
+        if (p.hasDischargeColumn) {
+          const old = !!p.dischargeDate && scanIsTooOld(p.dischargeDate, skipCutoff);
+          if (old) skippedDischarged++;
+          return !old;
+        }
+        const old = scanIsTooOld(p.visitDate, admissionCutoff);
+        if (old) skippedAdmitted++;
+        return !old;
+      }).map((p, i) => ({ ...p, index: i, patientKey: options.personKey || p.patientKey }));
+      skippedText = (skippedDischarged ? ` · bỏ qua ${skippedDischarged} ca ra viện trước ${scanFormatDay(skipCutoff)}` : "") +
+        (skippedAdmitted ? ` · bỏ qua ${skippedAdmitted} ca vào viện trước ${scanFormatDay(admissionCutoff)}` : "");
       if (!patients.length) {
         scanStatus.textContent = `Không có ca nào để quét${skippedText}.`;
         scanSetPaused(null);
@@ -4814,9 +4960,15 @@
             bhytResult = await bhytCheck;
           }
           if (scanStopRequested) break;
-          // NT.005.HSBA can arrive after the phiếu lists; wait up to 3 s for it
-          // when the case has a drug that needs a diagnosis check.
-          for (let waited = 0; auditDrugDiagnosisTargets().length && !auditMatchingIcdData() && waited < 3000 && !scanStopRequested; waited += 200) await scanSleep(200);
+          // The case has a drug that needs a diagnosis check (incl. ALBUNORM vs
+          // R57.2): wait briefly for HIS's own NT.005.HSBA, then, as HIS does not
+          // resend it for a case that was already selected, ask for it.
+          const needsIcd = () => auditDrugDiagnosisTargets().length || Array.from(auditState.medicineRows.values()).some(scanIsAlbunorm);
+          for (let waited = 0; needsIcd() && !auditMatchingIcdData() && waited < 1500 && !scanStopRequested; waited += 200) await scanSleep(200);
+          if (needsIcd() && !auditMatchingIcdData() && !scanStopRequested) {
+            const askedId = scanAskIcd(info);
+            for (let waited = 0; !auditMatchingIcdData() && !scanIcdMiss.has(askedId) && waited < 10000 && !scanStopRequested; waited += 200) await scanSleep(200);
+          }
           if (scanStopRequested) break;
           try { findings = scanCollectFindings(info, scanned); }
           catch (err) { findings = { errors: [{ module: "Hệ thống", item: "", message: `Không kiểm tra được: ${err && err.message || err}` }], counts: { dvkt: 0, drug: 0, services: 0 } }; }

@@ -16,7 +16,7 @@ It adds a **QUÉT** button to the HIS patient list. When you start a scan, it:
 |---|---|---|
 | `manifest.json` | – | Extension "Scan". Content scripts for HIS and the BHYT portal. |
 | `main.js` | HIS page (MAIN world), `document_start` | Captures HIS responses: services/DVKT, lab tests and results, drugs (đơn thuốc), times, patient and card details. Maps local drug codes to BHYT codes. |
-| `icd_capture.js` | HIS page (MAIN world), `document_start` | Captures the diagnosis payload (NT.005.HSBA) without sending extra requests. |
+| `icd_capture.js` | HIS page (MAIN world), `document_start` | Captures the diagnosis payload (NT.005.HSBA) when HIS loads it. During QUÉT, when HIS did not send it for a case that has a drug needing a diagnosis, it sends NT.005.HSBA itself with HIS's latest token, and keeps the reply only if its case number matches. |
 | `content.js` | HIS page, `document_idle` | The rules, the QUÉT button, the scan loop and the results panel. |
 | `bhyt_portal.js` | BHYT portal page, `document_idle` | Runs card lookups on the portal ("Thông tuyến KCB") and sends back what the portal shows. |
 | `portal_main.js` | BHYT portal page (MAIN world), `document_start` | Keeps the portal's timers running while its tab is in the background, so lookups do not stall. |
@@ -113,12 +113,13 @@ Missing or unreadable data is never reported as a violation. Only confirmed prob
 | `[Thuốc]` | error | **OXY** ends after discharge, or overlaps a ventilator (thở máy) period. |
 | `[Thuốc]` | error | **Chụp X-quang without Xenetix 300** ordered the same day. If any date is missing, Scan only checks that the visit has Xenetix 300. |
 | `[Thiếu chẩn đoán]` | error | **A drug without a matching diagnosis** (main or secondary ICD from NT.005.HSBA). 40.666, 40.677, 40.678, 40.679 and 40.68 need a stomach diagnosis: reflux, gastric/duodenal/oesophageal ulcer, perforation, GI bleeding. Cinnarizin (40.80) and Betahistin (40.899) need "Rối loạn tiền đình" or "Chóng mặt". One error per drug per day. |
+| `[Chẩn đoán]` | warning | The diagnosis could not be read, so the check above was not done for that drug. Hover for the reason. |
 
 ### ALBUNORM (needs both Xét nghiệm and Thuốc ticked)
 
 | Label | Type | Rule |
 |---|---|---|
-| `[Albumin]` | error | ALBUNORM ordered on the **same day** as an Albumin [Máu] result **> 25 g/L**. The ALBUNORM row is also red in the Thuốc table. |
+| `[Albumin]` | error | ALBUNORM ordered on the **same day** as an Albumin [Máu] result **> 25 g/L**, with no sốc nhiễm trùng (R57.2) diagnosis. The ALBUNORM row is also red in the Thuốc table. If the diagnosis could not be read, this is an `[Albunorm]` warning instead. |
 | `[Albunorm]` | warning | Any other ALBUNORM order. The line shows that day's albumin result (≤ 25 g/L), or says there was none. |
 
 ### PTTT
